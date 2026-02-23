@@ -1,38 +1,65 @@
 import express from 'express';
 import fetch from 'node-fetch';
 import cors from 'cors';
-import { pipeline } from 'stream/promises';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const { parser } = require('stream-json');
 const { streamArray } = require('stream-json/streamers/StreamArray');
 const { pick } = require('stream-json/filters/Pick');
+const Database = require('better-sqlite3');
 
 const app = express();
 app.use(cors());
 
-// Minnescache för alla jobb
-let cache = { jobs: [], updatedAt: null };
-let isLoadingSnapshot = false;
+// SQLite-databas på disk
+const db = new Database('/tmp/jobs.db');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    headline TEXT,
+    employer_name TEXT,
+    municipality TEXT,
+    region TEXT,
+    employment_type TEXT,
+    webpage_url TEXT,
+    publication_date TEXT,
+    description TEXT,
+    raw JSON
+  );
+  CREATE INDEX IF NOT EXISTS idx_headline ON jobs(headline);
+  CREATE INDEX IF NOT EXISTS idx_municipality ON jobs(municipality);
+  CREATE INDEX IF NOT EXISTS idx_region ON jobs(region);
+`);
 
-// Strömma snapshot (~300 MB) utan att ladda allt i minnet
+let isLoadingSnapshot = false;
+let snapshotDone = false;
+let updatedAt = null;
+let jobCount = 0;
+
+// Strömma snapshot (~300 MB, ~150k jobb) direkt in i SQLite
 async function fetchSnapshot() {
   if (isLoadingSnapshot) return;
   isLoadingSnapshot = true;
-  console.log('Startar snapshot-strömning...');
+  console.log('Startar snapshot-strömning till SQLite...');
 
   try {
     const res = await fetch('https://jobstream.api.jobtechdev.se/snapshot', {
       headers: { 'accept': 'application/json' }
     });
+    if (!res.ok) { console.error(`Snapshot HTTP ${res.status}`); return; }
 
-    if (!res.ok) {
-      console.error(`Snapshot HTTP-fel: ${res.status}`);
-      isLoadingSnapshot = false;
-      return;
-    }
+    // Rensa gamla jobb
+    db.exec('DELETE FROM jobs');
 
-    const jobs = [];
+    const insertJob = db.prepare(`
+      INSERT OR REPLACE INTO jobs (id, headline, employer_name, municipality, region, employment_type, webpage_url, publication_date, description, raw)
+      VALUES (@id, @headline, @employer_name, @municipality, @region, @employment_type, @webpage_url, @publication_date, @description, @raw)
+    `);
+    const insertMany = db.transaction((jobs) => {
+      for (const j of jobs) insertJob.run(j);
+    });
+
+    let batch = [];
     let count = 0;
 
     await new Promise((resolve, reject) => {
@@ -42,28 +69,51 @@ async function fetchSnapshot() {
         .pipe(streamArray());
 
       stream.on('data', ({ value }) => {
-        const job = value._source ?? value;
-        jobs.push(job);
+        const j = value._source ?? value;
+        batch.push({
+          id: j.id ?? '',
+          headline: j.headline ?? '',
+          employer_name: j.employer?.name ?? '',
+          municipality: j.workplace_address?.municipality ?? '',
+          region: j.workplace_address?.region ?? '',
+          employment_type: j.employment_type?.label ?? '',
+          webpage_url: j.webpage_url ?? '',
+          publication_date: j.publication_date ?? '',
+          description: (j.description?.text ?? '').slice(0, 500),
+          raw: JSON.stringify({
+            id: j.id, headline: j.headline,
+            employer: j.employer,
+            workplace_address: j.workplace_address,
+            employment_type: j.employment_type,
+            webpage_url: j.webpage_url,
+            publication_date: j.publication_date,
+            description: { text: (j.description?.text ?? '').slice(0, 300) }
+          })
+        });
         count++;
-        if (count % 10000 === 0) {
-          console.log(`Snapshot: strömmat ${count} jobb...`);
+        if (batch.length >= 500) {
+          insertMany(batch);
+          batch = [];
+          if (count % 10000 === 0) console.log(`Snapshot: ${count} jobb...`);
         }
       });
 
       stream.on('end', () => {
-        console.log(`Snapshot klar: ${count} jobb totalt`);
+        if (batch.length > 0) insertMany(batch);
+        console.log(`Snapshot klar: ${count} jobb i SQLite`);
         resolve();
       });
 
       stream.on('error', (err) => {
-        console.error('Snapshot stream-fel:', err.message);
+        console.error('Stream-fel:', err.message);
         reject(err);
       });
     });
 
-    cache.jobs = jobs;
-    cache.updatedAt = new Date().toISOString();
-    console.log(`Cache uppdaterad med ${cache.jobs.length} jobb`);
+    jobCount = db.prepare('SELECT COUNT(*) as c FROM jobs').get().c;
+    updatedAt = new Date().toISOString();
+    snapshotDone = true;
+    console.log(`Klar! ${jobCount} jobb tillgängliga`);
   } catch (err) {
     console.error('fetchSnapshot-fel:', err.message);
   } finally {
@@ -71,91 +121,103 @@ async function fetchSnapshot() {
   }
 }
 
-// Uppdatera med stream var 60s (lägger till/tar bort jobb)
+// Stream-uppdatering var 60s
 let lastSeen = null;
 async function fetchStream() {
+  if (!snapshotDone) return;
   try {
     const now = new Date();
-    const since = lastSeen ?? new Date(now.getTime() - 2 * 60 * 1000).toISOString().replace('T', 'T').slice(0, 19);
-    const url = `https://jobstream.api.jobtechdev.se/stream?date=${encodeURIComponent(since)}`;
-    const res = await fetch(url, { headers: { 'accept': 'application/json' } });
-
-    if (!res.ok) { console.error(`Stream HTTP-fel: ${res.status}`); return; }
-
+    const since = lastSeen ?? new Date(now - 120000).toISOString().slice(0, 19);
+    const res = await fetch(`https://jobstream.api.jobtechdev.se/stream?date=${encodeURIComponent(since)}`, {
+      headers: { 'accept': 'application/json' }
+    });
+    if (!res.ok) return;
     const data = await res.json();
-    if (!Array.isArray(data)) return;
+    if (!Array.isArray(data) || data.length === 0) return;
 
-    const removed = new Set(data.filter(j => j.removed).map(j => j.id));
-    const added = data.filter(j => !j.removed && j.id);
+    const insertJob = db.prepare(`
+      INSERT OR REPLACE INTO jobs (id, headline, employer_name, municipality, region, employment_type, webpage_url, publication_date, description, raw)
+      VALUES (@id, @headline, @employer_name, @municipality, @region, @employment_type, @webpage_url, @publication_date, @description, @raw)
+    `);
+    const deleteJob = db.prepare('DELETE FROM jobs WHERE id = ?');
 
-    if (removed.size > 0) {
-      cache.jobs = cache.jobs.filter(j => !removed.has(j.id));
-    }
-    if (added.length > 0) {
-      const existingIds = new Set(cache.jobs.map(j => j.id));
-      const newJobs = added.filter(j => !existingIds.has(j.id));
-      cache.jobs = [...newJobs, ...cache.jobs];
-    }
+    const update = db.transaction(() => {
+      let added = 0, removed = 0;
+      for (const j of data) {
+        if (j.removed) { deleteJob.run(j.id); removed++; }
+        else {
+          insertJob.run({
+            id: j.id ?? '', headline: j.headline ?? '',
+            employer_name: j.employer?.name ?? '',
+            municipality: j.workplace_address?.municipality ?? '',
+            region: j.workplace_address?.region ?? '',
+            employment_type: j.employment_type?.label ?? '',
+            webpage_url: j.webpage_url ?? '',
+            publication_date: j.publication_date ?? '',
+            description: (j.description?.text ?? '').slice(0, 500),
+            raw: JSON.stringify({
+              id: j.id, headline: j.headline, employer: j.employer,
+              workplace_address: j.workplace_address,
+              employment_type: j.employment_type,
+              webpage_url: j.webpage_url, publication_date: j.publication_date,
+              description: { text: (j.description?.text ?? '').slice(0, 300) }
+            })
+          });
+          added++;
+        }
+      }
+      return { added, removed };
+    });
 
+    const { added, removed } = update();
+    jobCount = db.prepare('SELECT COUNT(*) as c FROM jobs').get().c;
+    updatedAt = now.toISOString();
     lastSeen = now.toISOString().slice(0, 19);
-    cache.updatedAt = now.toISOString();
-    console.log(`Stream: +${added.length} nya, -${removed.size} borttagna. Totalt: ${cache.jobs.length}`);
+    console.log(`Stream: +${added} -${removed}. Totalt: ${jobCount}`);
   } catch (err) {
     console.error('fetchStream-fel:', err.message);
   }
 }
 
-// API: GET /api/jobs?q=keyword&lan=ort&limit=50&offset=0
+// API: GET /api/jobs?q=&lan=&limit=50&offset=0
 app.get('/api/jobs', (req, res) => {
-  const q = (req.query.q || '').toLowerCase().trim();
-  const lan = (req.query.lan || '').toLowerCase().trim();
+  const q = (req.query.q || '').trim();
+  const lan = (req.query.lan || '').trim();
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
 
-  let jobs = cache.jobs;
+  let whereClauses = [];
+  let params = [];
 
   if (q) {
-    jobs = jobs.filter(j =>
-      j.headline?.toLowerCase().includes(q) ||
-      j.employer?.name?.toLowerCase().includes(q) ||
-      j.description?.text?.toLowerCase().includes(q)
-    );
+    whereClauses.push('(headline LIKE ? OR employer_name LIKE ? OR description LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
   }
   if (lan) {
-    jobs = jobs.filter(j =>
-      j.workplace_address?.municipality?.toLowerCase().includes(lan) ||
-      j.workplace_address?.region?.toLowerCase().includes(lan) ||
-      j.workplace_address?.city?.toLowerCase().includes(lan)
-    );
+    whereClauses.push('(municipality LIKE ? OR region LIKE ?)');
+    params.push(`%${lan}%`, `%${lan}%`);
   }
 
-  const total = jobs.length;
-  const page = jobs.slice(offset, offset + limit);
+  const where = whereClauses.length > 0 ? 'WHERE ' + whereClauses.join(' AND ') : '';
 
-  res.json({
-    total,
-    offset,
-    limit,
-    updatedAt: cache.updatedAt,
-    isLoading: isLoadingSnapshot,
-    jobs: page
-  });
+  const total = db.prepare(`SELECT COUNT(*) as c FROM jobs ${where}`).get(...params).c;
+  const rows = db.prepare(`SELECT raw FROM jobs ${where} ORDER BY publication_date DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
+  const jobs = rows.map(r => JSON.parse(r.raw));
+
+  res.json({ total, offset, limit, updatedAt, isLoading: isLoadingSnapshot, jobs });
 });
 
 app.get('/health', (req, res) => res.json({
-  status: 'ok',
-  jobs: cache.jobs.length,
+  status: 'ok', jobs: jobCount,
   isLoading: isLoadingSnapshot,
-  updatedAt: cache.updatedAt
+  snapshotDone, updatedAt
 }));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`JobForGo backend kör på port ${PORT}`);
-  // Starta snapshot-hämtning i bakgrunden
   fetchSnapshot().then(() => {
     lastSeen = new Date().toISOString().slice(0, 19);
-    // Uppdatera med stream var 60s
-    setInterval(fetchStream, 60 * 1000);
+    setInterval(fetchStream, 60000);
   });
 });
